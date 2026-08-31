@@ -1,73 +1,62 @@
-"""
-Hugging Face dataset repo -> Telegram channel poster (Render Web Service version)
-------------------------------------------------------
-- HF dataset repo theke video/image download kore
-- 50MB er niche hole bot token diye pathabe (fast, simple)
-- 50MB er upore hole string session (Pyrogram user account) diye pathabe
-  (Telegram Bot API te 50MB upload limit ache, kintu user account/MTProto diye
-  2GB porjonto pathano jay)
-- Render FREE Web Service e deploy korar jonno: ekta choto Flask server
-  chalu thake (/ping route), UptimeRobot প্রতি 5 min e ping korle server
-  ghumiye jabe na (free tier 15 min inactive hole sleep hoye jay).
-- Upload kaj ekta background thread e ekbar automatic start hoy.
+"""Hugging Face dataset -> Telegram video bot.
 
-Install:
-    pip install pyrogram tgcrypto huggingface_hub python-dotenv requests flask
+The bot lists the media files in the Hugging Face dataset in private chat.
+A user can press a button (or send a file name) to receive that file. Files
+that fit in Telegram Bot API's limits are sent by the bot; larger files are
+sent with the configured Pyrogram user session.
 
-Run (local test):
-    python hf_to_telegram.py
+Required Render environment variables:
+    HF_REPO_ID, BOT_TOKEN, API_ID, API_HASH, STRING_SESSION
+Optional:
+    HF_TOKEN, CHANNEL, PORT
 
-Render e deploy korar somoy:
-    Start command: python hf_to_telegram.py
-    Environment variables gula Render dashboard > Environment e boshate hobe
-    (nichey .env file e value gula deya ache, oigulai copy kore boshabe)
+CHANNEL is only needed if you also want to use a channel as a destination.
+The bot must be started by the user first; Telegram does not allow a bot to
+start a private conversation with an arbitrary user.
 """
 
 import asyncio
 import os
 import threading
 import time
+from pathlib import Path
 
-# Pyrogram's current sync wrapper calls asyncio.get_event_loop() while it is
-# imported. Python 3.14 no longer creates a loop automatically, so importing
-# Pyrogram on Render fails with "There is no current event loop". Create one
-# before importing Pyrogram (the wrapper can then reuse it).
+# Pyrogram's sync wrapper calls get_event_loop() while it is imported. Python
+# 3.14 no longer creates one automatically.
 try:
     asyncio.get_event_loop()
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
+import requests
 from dotenv import load_dotenv
+from flask import Flask
 from huggingface_hub import HfApi, hf_hub_download
 from pyrogram import Client
-from flask import Flask
 
 load_dotenv()
 
-# ---------------- CONFIG (.env / Render Environment theke asche) ----------------
 HF_REPO_ID = os.environ["HF_REPO_ID"]
 HF_REPO_TYPE = "dataset"
-
+HF_TOKEN = os.environ.get("HF_TOKEN")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHANNEL = os.environ["CHANNEL"]
-
+CHANNEL = os.environ.get("CHANNEL", "")
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 STRING_SESSION = os.environ["STRING_SESSION"]
+DOWNLOAD_DIR = Path("./hf_downloads")
+PORT = int(os.environ.get("PORT", 10000))
 
-# Telegram Bot API limits are different for videos and photos.
-# Photos are limited to 10 MB, while videos are limited to 50 MB.
+VIDEO_EXT = (".mp4", ".mov", ".mkv", ".webm")
+IMAGE_EXT = (".jpg", ".jpeg", ".png")
 BOT_VIDEO_LIMIT_MB = 50
 BOT_PHOTO_LIMIT_MB = 10
-DOWNLOAD_DIR = "./hf_downloads"
-PORT = int(os.environ.get("PORT", 10000))
-# -----------------------------------------
-
-VIDEO_EXT = (".mp4", ".mov", ".mkv")
-IMAGE_EXT = (".jpg", ".jpeg", ".png")
+PAGE_SIZE = 40
 
 app = Flask(__name__)
 status = {"state": "starting", "done": 0, "total": 0, "current": ""}
+media_files = []
+media_lock = threading.Lock()
 
 
 @app.route("/")
@@ -81,60 +70,70 @@ def ping():
     }
 
 
+def telegram(method, **kwargs):
+    """Call the Bot API and raise an actionable error on failure."""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    response = requests.post(url, data=kwargs, timeout=(15, 120))
+    try:
+        result = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Telegram returned invalid JSON: {response.text[:300]}") from exc
+    if not response.ok or not result.get("ok"):
+        raise RuntimeError(f"Telegram {method} failed: {result.get('description', response.text[:300])}")
+    return result["result"]
+
+
 def list_repo_media():
-    api = HfApi()
+    api = HfApi(token=HF_TOKEN)
     files = api.list_repo_files(repo_id=HF_REPO_ID, repo_type=HF_REPO_TYPE)
-    return [f for f in files if f.lower().endswith(VIDEO_EXT + IMAGE_EXT)]
+    return sorted(
+        f for f in files
+        if f.lower().endswith(VIDEO_EXT + IMAGE_EXT)
+    )
+
+
+def refresh_media():
+    files = list_repo_media()
+    with media_lock:
+        media_files[:] = files
+        status["total"] = len(files)
+    print(f"HF repo te {len(files)} ta media file paoa gelo.")
+    return files
 
 
 def download_file(filename):
-    path = hf_hub_download(
+    return hf_hub_download(
         repo_id=HF_REPO_ID,
         repo_type=HF_REPO_TYPE,
         filename=filename,
-        local_dir=DOWNLOAD_DIR,
+        token=HF_TOKEN,
+        local_dir=str(DOWNLOAD_DIR),
     )
-    return path
 
 
-def send_with_bot(local_path, filename):
-    """Bot API diye pathano. Telegram-er error hole tar details log koro."""
-    import requests
-
+def send_with_bot(local_path, filename, chat_id):
     is_video = filename.lower().endswith(VIDEO_EXT)
     method = "sendVideo" if is_video else "sendPhoto"
     field = "video" if is_video else "photo"
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-
+    with open(local_path, "rb") as file_handle:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+        response = requests.post(
+            url,
+            data={"chat_id": chat_id},
+            files={field: (os.path.basename(filename), file_handle)},
+            timeout=(15, 600),
+        )
     try:
-        with open(local_path, "rb") as f:
-            resp = requests.post(
-                url,
-                data={"chat_id": CHANNEL},
-                files={field: (os.path.basename(filename), f)},
-                timeout=(15, 300),
-            )
-        # HTTP 200 is not enough: Telegram also returns {"ok": false, ...}.
-        result = resp.json()
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Telegram network error: {exc}") from exc
+        result = response.json()
     except ValueError as exc:
-        raise RuntimeError(
-            f"Telegram returned non-JSON response ({resp.status_code}): "
-            f"{resp.text[:300]}"
-        ) from exc
-
-    if not resp.ok or not result.get("ok"):
-        error = result.get("description", resp.text[:300])
-        raise RuntimeError(f"Telegram {method} failed ({resp.status_code}): {error}")
-
-    return True
+        raise RuntimeError(f"Telegram returned invalid JSON: {response.text[:300]}") from exc
+    if not response.ok or not result.get("ok"):
+        raise RuntimeError(f"Telegram {method} failed: {result.get('description', response.text[:300])}")
 
 
-def send_with_userbot(local_path, filename):
-    """Pyrogram (string session) diye pathano (>50MB er jonno)."""
+def send_with_userbot(local_path, filename, chat_id):
+    """Use the personal account for files above Bot API limits."""
     is_video = filename.lower().endswith(VIDEO_EXT)
-
     with Client(
         "userbot_session",
         api_id=API_ID,
@@ -143,61 +142,149 @@ def send_with_userbot(local_path, filename):
         in_memory=True,
     ) as client:
         if is_video:
-            client.send_video(CHANNEL, local_path)
+            client.send_video(chat_id, local_path, supports_streaming=True)
         else:
-            client.send_photo(CHANNEL, local_path)
+            client.send_photo(chat_id, local_path)
 
 
-def run_upload_job():
+def make_keyboard(page=0):
+    with media_lock:
+        files = list(media_files)
+    start = page * PAGE_SIZE
+    rows = []
+    for index in range(start, min(start + PAGE_SIZE, len(files)), 2):
+        row = []
+        for item_index in range(index, min(index + 2, len(files))):
+            name = Path(files[item_index]).stem
+            # Telegram button labels should be short, while callback data is an index.
+            row.append({"text": name[:28], "callback_data": f"video:{item_index}"})
+        rows.append(row)
+    navigation = []
+    if page > 0:
+        navigation.append({"text": "⬅️ Previous", "callback_data": f"page:{page - 1}"})
+    if start + PAGE_SIZE < len(files):
+        navigation.append({"text": "Next ➡️", "callback_data": f"page:{page + 1}"})
+    if navigation:
+        rows.append(navigation)
+    return {"inline_keyboard": rows}
+
+
+def send_menu(chat_id, page=0, edit_message_id=None):
+    with media_lock:
+        count = len(media_files)
+    text = (
+        f"🎬 {count} ta video/file available.\n\n"
+        "Nicher button-e click kore video nin, ba file-er naam likhun."
+    )
+    if edit_message_id:
+        telegram("editMessageText", chat_id=chat_id, message_id=edit_message_id,
+                 text=text, reply_markup=__import__("json").dumps(make_keyboard(page)))
+    else:
+        telegram("sendMessage", chat_id=chat_id, text=text,
+                 reply_markup=__import__("json").dumps(make_keyboard(page)))
+
+
+def deliver_file(chat_id, index):
+    with media_lock:
+        if index < 0 or index >= len(media_files):
+            raise RuntimeError("Video list changed. Please send /start again.")
+        filename = media_files[index]
+
+    status["current"] = filename
+    telegram("sendMessage", chat_id=chat_id, text=f"⏳ Downloading: {Path(filename).name}")
     local_path = None
     try:
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        files = list_repo_media()
-        status["total"] = len(files)
+        local_path = download_file(filename)
+        size_mb = os.path.getsize(local_path) / (1024 * 1024)
+        is_video = filename.lower().endswith(VIDEO_EXT)
+        limit = BOT_VIDEO_LIMIT_MB if is_video else BOT_PHOTO_LIMIT_MB
+        if size_mb <= limit:
+            send_with_bot(local_path, filename, chat_id)
+        else:
+            # The personal account can send up to Telegram's current MTProto limit.
+            send_with_userbot(local_path, filename, chat_id)
+        telegram("sendMessage", chat_id=chat_id, text="✅ Video pathano hoyeche.")
+    finally:
+        if local_path and os.path.exists(local_path):
+            os.remove(local_path)
+
+
+def handle_update(update):
+    callback = update.get("callback_query")
+    if callback:
+        callback_id = callback["id"]
+        chat_id = callback["message"]["chat"]["id"]
+        telegram("answerCallbackQuery", callback_query_id=callback_id)
+        data = callback.get("data", "")
+        if data.startswith("page:"):
+            page = int(data.split(":", 1)[1])
+            send_menu(chat_id, page, callback["message"]["message_id"])
+        elif data.startswith("video:"):
+            threading.Thread(
+                target=deliver_safely, args=(chat_id, int(data.split(":", 1)[1])), daemon=True
+            ).start()
+        return
+
+    message = update.get("message") or {}
+    chat_id = message.get("chat", {}).get("id")
+    if not chat_id:
+        return
+    text = (message.get("text") or "").strip()
+    if text in ("/start", "/videos", "/help"):
+        send_menu(chat_id)
+        return
+    if text:
+        with media_lock:
+            matches = [i for i, name in enumerate(media_files) if text.lower() in name.lower()]
+        if len(matches) == 1:
+            threading.Thread(target=deliver_safely, args=(chat_id, matches[0]), daemon=True).start()
+        elif matches:
+            telegram("sendMessage", chat_id=chat_id, text="একাধিক file পাওয়া গেছে:",
+                     reply_markup=__import__("json").dumps({"inline_keyboard": [
+                         [{"text": Path(media_files[i]).stem[:28], "callback_data": f"video:{i}"}]
+                         for i in matches[:PAGE_SIZE]
+                     ]}))
+        else:
+            telegram("sendMessage", chat_id=chat_id, text="File পাওয়া যায়নি। /start চাপুন এবং button ব্যবহার করুন।")
+
+
+def deliver_safely(chat_id, index):
+    try:
+        deliver_file(chat_id, index)
+    except Exception as exc:
+        print(f"Delivery error for {chat_id}: {exc}")
+        try:
+            telegram("sendMessage", chat_id=chat_id, text=f"❌ পাঠানো যায়নি: {exc}")
+        except Exception as notify_error:
+            print(f"Could not notify user: {notify_error}")
+
+
+def bot_polling():
+    status["state"] = "loading"
+    try:
+        refresh_media()
+        telegram("deleteWebhook", drop_pending_updates=False)
+        telegram("getMe")
         status["state"] = "running"
-        print(f"Repo te {len(files)} ta media file paoa gelo.")
-
-        for idx, filename in enumerate(files, start=1):
-            status["current"] = filename
-            print(f"\n--- {filename} ---")
-            print("Download hocche...")
-            local_path = download_file(filename)
-
-            size_mb = os.path.getsize(local_path) / (1024 * 1024)
-            is_video = filename.lower().endswith(VIDEO_EXT)
-            bot_limit = BOT_VIDEO_LIMIT_MB if is_video else BOT_PHOTO_LIMIT_MB
-            print(f"Size: {size_mb:.2f} MB (Bot limit: {bot_limit} MB)")
-
-            try:
-                if size_mb <= bot_limit:
-                    print("Bot token diye pathano hocche...")
-                    send_with_bot(local_path, filename)
-                    print("Pathano hoyeche.")
-                else:
-                    print(f"{bot_limit}MB er beshi, userbot diye pathano hocche...")
-                    send_with_userbot(local_path, filename)
-                    print("Pathano hoyeche.")
-            except Exception as e:
-                print(f"Error: {e}")
-            finally:
-                if local_path and os.path.exists(local_path):
-                    os.remove(local_path)
-                local_path = None
-                status["done"] = idx
-
-        status["state"] = "finished"
-        print("\nSob media process shesh.")
-    except Exception as e:
+        offset = None
+        while True:
+            params = {"timeout": 50}
+            if offset is not None:
+                params["offset"] = offset
+            updates = telegram("getUpdates", **params)
+            for update in updates:
+                offset = update["update_id"] + 1
+                try:
+                    handle_update(update)
+                except Exception as exc:
+                    print(f"Update error: {exc}")
+    except Exception as exc:
         status["state"] = "failed"
-        status["current"] = str(e)
-        print(f"Upload job failed: {e}")
-
-
-def start_background_job():
-    time.sleep(3)  # server age up hote dao
-    run_upload_job()
+        status["current"] = str(exc)
+        print(f"Bot polling failed: {exc}")
 
 
 if __name__ == "__main__":
-    threading.Thread(target=start_background_job, daemon=True).start()
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    threading.Thread(target=bot_polling, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT)
