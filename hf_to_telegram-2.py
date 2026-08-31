@@ -23,9 +23,20 @@ Render e deploy korar somoy:
     (nichey .env file e value gula deya ache, oigulai copy kore boshabe)
 """
 
+import asyncio
 import os
 import threading
 import time
+
+# Pyrogram's current sync wrapper calls asyncio.get_event_loop() while it is
+# imported. Python 3.14 no longer creates a loop automatically, so importing
+# Pyrogram on Render fails with "There is no current event loop". Create one
+# before importing Pyrogram (the wrapper can then reuse it).
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 from dotenv import load_dotenv
 from huggingface_hub import HfApi, hf_hub_download
 from pyrogram import Client
