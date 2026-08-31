@@ -99,7 +99,7 @@ def refresh_media():
     with media_lock:
         media_files[:] = files
         status["total"] = len(files)
-    print(f"HF repo te {len(files)} ta media file paoa gelo.")
+    print(f"HF repo te {len(files)} ta media file paoa gelo.", flush=True)
     return files
 
 
@@ -149,7 +149,7 @@ def validate_user_session():
         raise RuntimeError("CHANNEL environment variable is required")
     with make_userbot_client() as client:
         me = client.get_me()
-        print(f"User session OK: @{me.username or me.id}; channel target: {CHANNEL}")
+        print(f"User session OK: @{me.username or me.id}; channel target: {CHANNEL}", flush=True)
 
 
 def send_with_userbot(local_path, filename):
@@ -265,7 +265,7 @@ def deliver_file(chat_id, index):
     try:
         local_path = download_file(filename)
         size_mb = os.path.getsize(local_path) / (1024 * 1024)
-        print(f"New file: {filename} ({size_mb:.2f} MB), posting to channel...")
+        print(f"New file: {filename} ({size_mb:.2f} MB), posting to channel...", flush=True)
 
         # Every first request is archived in the channel. This bypasses the
         # Bot API upload limit; afterwards copyMessage sends it without a
@@ -322,22 +322,27 @@ def deliver_safely(chat_id, index):
     try:
         deliver_file(chat_id, index)
     except Exception as exc:
-        print(f"Delivery error for {chat_id}: {exc}")
+        print(f"Delivery error for {chat_id}: {exc}", flush=True)
         try:
             telegram("sendMessage", chat_id=chat_id, text=f"❌ পাঠানো যায়নি: {exc}")
         except Exception as notify_error:
-            print(f"Could not notify user: {notify_error}")
+            print(f"Could not notify user: {notify_error}", flush=True)
 
 
 def bot_polling():
     status["state"] = "loading"
+    print("Bot worker started", flush=True)
     try:
         init_cache()
+        print("Cache database ready", flush=True)
+        # Remove old webhook before polling, so a bad user session does not
+        # hide the Bot API startup diagnostics.
+        telegram("deleteWebhook", drop_pending_updates=False)
+        bot_info = telegram("getMe")
+        print(f"Bot API OK: @{bot_info.get('username')}", flush=True)
+        status["state"] = "running"
         validate_user_session()
         refresh_media()
-        telegram("deleteWebhook", drop_pending_updates=False)
-        telegram("getMe")
-        status["state"] = "running"
         offset = None
         while True:
             params = {"timeout": 50}
@@ -349,11 +354,12 @@ def bot_polling():
                 try:
                     handle_update(update)
                 except Exception as exc:
-                    print(f"Update error: {exc}")
+                    print(f"Update error: {exc}", flush=True)
     except Exception as exc:
         status["state"] = "failed"
         status["current"] = str(exc)
-        print(f"Bot polling failed: {exc}")
+        print(f"Bot polling failed: {exc}", flush=True)
+
 
 
 if __name__ == "__main__":
