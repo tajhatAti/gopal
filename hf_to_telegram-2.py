@@ -55,7 +55,10 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 STRING_SESSION = os.environ["STRING_SESSION"]
 
-SIZE_LIMIT_MB = 50
+# Telegram Bot API limits are different for videos and photos.
+# Photos are limited to 10 MB, while videos are limited to 50 MB.
+BOT_VIDEO_LIMIT_MB = 50
+BOT_PHOTO_LIMIT_MB = 10
 DOWNLOAD_DIR = "./hf_downloads"
 PORT = int(os.environ.get("PORT", 10000))
 # -----------------------------------------
@@ -95,17 +98,37 @@ def download_file(filename):
 
 
 def send_with_bot(local_path, filename):
-    """Bot API diye pathano (<=50MB er jonno)."""
+    """Bot API diye pathano. Telegram-er error hole tar details log koro."""
     import requests
 
     is_video = filename.lower().endswith(VIDEO_EXT)
     method = "sendVideo" if is_video else "sendPhoto"
     field = "video" if is_video else "photo"
-
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    with open(local_path, "rb") as f:
-        resp = requests.post(url, data={"chat_id": CHANNEL}, files={field: f})
-    return resp.ok
+
+    try:
+        with open(local_path, "rb") as f:
+            resp = requests.post(
+                url,
+                data={"chat_id": CHANNEL},
+                files={field: (os.path.basename(filename), f)},
+                timeout=(15, 300),
+            )
+        # HTTP 200 is not enough: Telegram also returns {"ok": false, ...}.
+        result = resp.json()
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Telegram network error: {exc}") from exc
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Telegram returned non-JSON response ({resp.status_code}): "
+            f"{resp.text[:300]}"
+        ) from exc
+
+    if not resp.ok or not result.get("ok"):
+        error = result.get("description", resp.text[:300])
+        raise RuntimeError(f"Telegram {method} failed ({resp.status_code}): {error}")
+
+    return True
 
 
 def send_with_userbot(local_path, filename):
@@ -126,39 +149,48 @@ def send_with_userbot(local_path, filename):
 
 
 def run_upload_job():
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    files = list_repo_media()
-    status["total"] = len(files)
-    status["state"] = "running"
-    print(f"Repo te {len(files)} ta media file paoa gelo.")
+    local_path = None
+    try:
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        files = list_repo_media()
+        status["total"] = len(files)
+        status["state"] = "running"
+        print(f"Repo te {len(files)} ta media file paoa gelo.")
 
-    for idx, filename in enumerate(files, start=1):
-        status["current"] = filename
-        print(f"\n--- {filename} ---")
-        print("Download hocche...")
-        local_path = download_file(filename)
+        for idx, filename in enumerate(files, start=1):
+            status["current"] = filename
+            print(f"\n--- {filename} ---")
+            print("Download hocche...")
+            local_path = download_file(filename)
 
-        size_mb = os.path.getsize(local_path) / (1024 * 1024)
-        print(f"Size: {size_mb:.2f} MB")
+            size_mb = os.path.getsize(local_path) / (1024 * 1024)
+            is_video = filename.lower().endswith(VIDEO_EXT)
+            bot_limit = BOT_VIDEO_LIMIT_MB if is_video else BOT_PHOTO_LIMIT_MB
+            print(f"Size: {size_mb:.2f} MB (Bot limit: {bot_limit} MB)")
 
-        try:
-            if size_mb <= SIZE_LIMIT_MB:
-                print("Bot token diye pathano hocche...")
-                ok = send_with_bot(local_path, filename)
-                print("Pathano hoyeche." if ok else "Bot diye pathate fail korlo.")
-            else:
-                print("50MB er beshi, userbot (string session) diye pathano hocche...")
-                send_with_userbot(local_path, filename)
-                print("Pathano hoyeche.")
-        except Exception as e:
-            print(f"Error: {e}")
-        finally:
-            if os.path.exists(local_path):
-                os.remove(local_path)
-            status["done"] = idx
+            try:
+                if size_mb <= bot_limit:
+                    print("Bot token diye pathano hocche...")
+                    send_with_bot(local_path, filename)
+                    print("Pathano hoyeche.")
+                else:
+                    print(f"{bot_limit}MB er beshi, userbot diye pathano hocche...")
+                    send_with_userbot(local_path, filename)
+                    print("Pathano hoyeche.")
+            except Exception as e:
+                print(f"Error: {e}")
+            finally:
+                if local_path and os.path.exists(local_path):
+                    os.remove(local_path)
+                local_path = None
+                status["done"] = idx
 
-    status["state"] = "finished"
-    print("\nSob media process shesh.")
+        status["state"] = "finished"
+        print("\nSob media process shesh.")
+    except Exception as e:
+        status["state"] = "failed"
+        status["current"] = str(e)
+        print(f"Upload job failed: {e}")
 
 
 def start_background_job():
