@@ -17,6 +17,7 @@ start a private conversation with an arbitrary user.
 
 import asyncio
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -45,6 +46,7 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 STRING_SESSION = os.environ["STRING_SESSION"]
 DOWNLOAD_DIR = Path("./hf_downloads")
+CACHE_DB = os.environ.get("CACHE_DB", "video_cache.sqlite3")
 PORT = int(os.environ.get("PORT", 10000))
 
 VIDEO_EXT = (".mp4", ".mov", ".mkv", ".webm")
@@ -131,20 +133,76 @@ def send_with_bot(local_path, filename, chat_id):
         raise RuntimeError(f"Telegram {method} failed: {result.get('description', response.text[:300])}")
 
 
-def send_with_userbot(local_path, filename, chat_id):
-    """Use the personal account for files above Bot API limits."""
-    is_video = filename.lower().endswith(VIDEO_EXT)
-    with Client(
+def make_userbot_client():
+    return Client(
         "userbot_session",
         api_id=API_ID,
         api_hash=API_HASH,
         session_string=STRING_SESSION,
         in_memory=True,
-    ) as client:
+    )
+
+
+def validate_user_session():
+    """Fail early if STRING_SESSION/API credentials are invalid."""
+    if not CHANNEL:
+        raise RuntimeError("CHANNEL environment variable is required")
+    with make_userbot_client() as client:
+        me = client.get_me()
+        print(f"User session OK: @{me.username or me.id}; channel target: {CHANNEL}")
+
+
+def send_with_userbot(local_path, filename):
+    """Post every new file to the archive channel using the personal account."""
+    is_video = filename.lower().endswith(VIDEO_EXT)
+    with make_userbot_client() as client:
         if is_video:
-            client.send_video(chat_id, local_path, supports_streaming=True)
-        else:
-            client.send_photo(chat_id, local_path)
+            return client.send_video(CHANNEL, local_path, supports_streaming=True)
+        return client.send_photo(CHANNEL, local_path)
+
+
+def init_cache():
+    with sqlite3.connect(CACHE_DB) as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS videos (
+                filename TEXT PRIMARY KEY,
+                channel_message_id INTEGER NOT NULL
+            )
+        """)
+        db.commit()
+
+
+def cached_message_id(filename):
+    with sqlite3.connect(CACHE_DB) as db:
+        row = db.execute(
+            "SELECT channel_message_id FROM videos WHERE filename = ?", (filename,)
+        ).fetchone()
+    return row[0] if row else None
+
+
+def save_cached_message(filename, message_id):
+    with sqlite3.connect(CACHE_DB) as db:
+        db.execute(
+            "INSERT OR REPLACE INTO videos(filename, channel_message_id) VALUES (?, ?)",
+            (filename, message_id),
+        )
+        db.commit()
+
+
+def remove_cached_message(filename):
+    with sqlite3.connect(CACHE_DB) as db:
+        db.execute("DELETE FROM videos WHERE filename = ?", (filename,))
+        db.commit()
+
+
+def copy_from_channel(chat_id, message_id):
+    """copyMessage copies without Telegram's forwarded-from tag."""
+    return telegram(
+        "copyMessage",
+        chat_id=chat_id,
+        from_chat_id=CHANNEL,
+        message_id=message_id,
+    )
 
 
 def make_keyboard(page=0):
@@ -191,19 +249,31 @@ def deliver_file(chat_id, index):
         filename = media_files[index]
 
     status["current"] = filename
+    old_message_id = cached_message_id(filename)
+    if old_message_id:
+        telegram("sendMessage", chat_id=chat_id, text="📦 Channel archive থেকে পাঠানো হচ্ছে...")
+        try:
+            copy_from_channel(chat_id, old_message_id)
+            telegram("sendMessage", chat_id=chat_id, text="✅ Video pathano hoyeche.")
+            return
+        except Exception:
+            # The channel post may have been deleted; rebuild the archive entry.
+            remove_cached_message(filename)
+
     telegram("sendMessage", chat_id=chat_id, text=f"⏳ Downloading: {Path(filename).name}")
     local_path = None
     try:
         local_path = download_file(filename)
         size_mb = os.path.getsize(local_path) / (1024 * 1024)
-        is_video = filename.lower().endswith(VIDEO_EXT)
-        limit = BOT_VIDEO_LIMIT_MB if is_video else BOT_PHOTO_LIMIT_MB
-        if size_mb <= limit:
-            send_with_bot(local_path, filename, chat_id)
-        else:
-            # The personal account can send up to Telegram's current MTProto limit.
-            send_with_userbot(local_path, filename, chat_id)
-        telegram("sendMessage", chat_id=chat_id, text="✅ Video pathano hoyeche.")
+        print(f"New file: {filename} ({size_mb:.2f} MB), posting to channel...")
+
+        # Every first request is archived in the channel. This bypasses the
+        # Bot API upload limit; afterwards copyMessage sends it without a
+        # forwarded-from tag and without downloading it again.
+        channel_message = send_with_userbot(local_path, filename)
+        save_cached_message(filename, channel_message.id)
+        copy_from_channel(chat_id, channel_message.id)
+        telegram("sendMessage", chat_id=chat_id, text="✅ Video channel-e save kore pathano hoyeche.")
     finally:
         if local_path and os.path.exists(local_path):
             os.remove(local_path)
@@ -262,6 +332,8 @@ def deliver_safely(chat_id, index):
 def bot_polling():
     status["state"] = "loading"
     try:
+        init_cache()
+        validate_user_session()
         refresh_media()
         telegram("deleteWebhook", drop_pending_updates=False)
         telegram("getMe")
