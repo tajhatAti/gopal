@@ -1,0 +1,6 @@
+pyrogram
+tgcrypto
+huggingface_hub
+requests
+python-dotenv
+flask
